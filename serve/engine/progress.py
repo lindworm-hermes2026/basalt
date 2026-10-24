@@ -79,7 +79,9 @@ class LoadBars:
         return target
 
     def _target(self, target: str, copy: bool) -> dict:
-        return self.targets.setdefault((target, copy), {"plan": 0, "done": 0, "last": 0, "seen": 0, "start": None})
+        # MB/s rate display — rate sample fields (display-only, no copy-path effect)
+        return self.targets.setdefault((target, copy), {"plan": 0, "done": 0, "last": 0, "seen": 0, "start": None,
+                                                        "rate_bytes": 0, "rate_time": 0.0})
 
     def done(self) -> int:
         return sum(t["done"] + t["last"] for (tg, c), t in self.targets.items() if not c and tg != self.TABLE)
@@ -93,24 +95,33 @@ class LoadBars:
     def lines(self) -> list[str]:
         rows = []
         started = [kv for kv in self.targets.items() if kv[1]["start"] is not None]
+        now = time.time()
         for (target, copy), t in sorted(started, key=lambda kv: kv[1]["start"]):
+            # MB/s rate display — window rate since this target's last sample.
+            # Sampled here (once per beat off-tty; per update on a tty); never on a phase
+            # switch, so a phase reset carries the old sample until >=1 s of real window.
+            rate = ""
             have = t["done"] + t["last"]
+            if t["start"] is not None and t["rate_time"] and now - t["rate_time"] >= 1.0 and have >= t["rate_bytes"]:
+                rate = f"  {(have - t['rate_bytes']) / 1e6 / (now - t['rate_time']):.0f} MB/s"
+            if t["rate_time"] == 0.0 or now - t["rate_time"] >= 1.0:
+                t["rate_bytes"], t["rate_time"] = have, now
             if t["plan"] <= 0 and not have:
                 continue                               # planned to hold nothing
             if target == self.TABLE:
-                rows.append(("[server] loading the n-gram table into system ram", have, t["plan"]))
+                rows.append(("[server] loading the n-gram table into system ram", have, t["plan"], rate))
                 continue
             verb = "copying experts to" if copy else "loading weights into"
-            rows.append((f"[server] {verb} {self.name(target)}", have, t["plan"]))
+            rows.append((f"[server] {verb} {self.name(target)}", have, t["plan"], rate))
         pad = max((len(r[0]) for r in rows), default=0)
         out = []
-        for label, have, plan in rows:
+        for label, have, plan, rate in rows:
             if plan <= 0:                              # no plan yet: a count, not a bar
-                out.append(f"{label.ljust(pad)}  {have / 2**30:5.1f} GiB")
+                out.append(f"{label.ljust(pad)}  {have / 2**30:5.1f} GiB{rate}")
             else:
                 plan = max(plan, have)
                 out.append(f"{label.ljust(pad)} [{self._bar(have, plan, self.WIDTH)}] "
-                           f"{have / 2**30:5.1f}/{plan / 2**30:.1f} GiB")
+                           f"{have / 2**30:5.1f}/{plan / 2**30:.1f} GiB{rate}")
         return out
 
     def _erase(self):
@@ -321,6 +332,7 @@ def narrate_start(log_path: str, offset: int, done: threading.Event, heartbeat=2
     global _active
     bars = _active = LoadBars(out, gpus)
     t0 = last = time.time()
+    beat = t0                                # busy heartbeat (upstream hides bars off-tty)
     pos = offset
     while True:
         stop = done.wait(0.25)
@@ -354,6 +366,10 @@ def narrate_start(log_path: str, offset: int, done: threading.Event, heartbeat=2
             if _active is bars:
                 _active = None
             return
+        if time.time() - beat >= heartbeat:          # busy heartbeat
+            beat = time.time()
+            for r in bars.lines():                   # one text line per active target, every beat
+                bars.say(r)
         if time.time() - last > heartbeat:
             last = time.time()
             bars.say(f"[server] still starting, {time.time() - t0:.0f} s")
